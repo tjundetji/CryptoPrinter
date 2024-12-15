@@ -1,15 +1,45 @@
-import robin_stocks.robinhood as rh
-import pyotp
 import openai
 import os
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
 from datetime import datetime, timedelta
 import time
 import requests
 import re
+from dotenv import load_dotenv
+import logging
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
-totp  = pyotp.TOTP(os.getenv("TOTP")).now()
-login = rh.login(os.getenv("ROBINHOOD_EMAIL"), os.getenv("ROBINHOOD_PASSWORD"), mfa_code=totp)
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Configure logging to write to a file and the console
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("trades.log"),  # Log to a file named "trades.log"
+        logging.StreamHandler()            # Also log to the console
+    ]
+)
+
+
+# Binance client initialization (using testnet)
+binance_client = Client(
+    api_key=os.getenv("BINANCE_API_KEY"),
+    api_secret=os.getenv("BINANCE_API_SECRET"),
+)
+binance_client.API_URL = 'https://testnet.binance.vision/api'  # Use testnet URL
+
+
+# Load environment variables
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+# Instantiate the OpenAI client
+client = openai.OpenAI(api_key=openai_api_key)
+
 symbols = ["BTC", "ETH", "BNB", "XRP", "ADA"]
 
 PROMPT_FOR_AI = f"""
@@ -48,128 +78,138 @@ def record_trade(action, symbol, amount, limit=None):
         "symbol": symbol,
         "amount": amount,
         "time": datetime.now().isoformat(),
+        "portfolio_value_usd": get_portfolio_value_in_usd(),
+
     }
     if limit is not None:
         trade_info["limit"] = limit
     past_trades.append(trade_info)
-    if len(past_trades) > 10:  # keep only the last 10 trades
+    if len(past_trades) > 10:  # Keep only the last 10 trades
         past_trades.pop(0)
 
 def get_crypto_infos():
     infos = {}
     for symbol in symbols:
-        quote = rh.get_crypto_quote(symbol)
-        useful_info = {
-            'symbol': quote['symbol'],
-            'ask_price': quote['ask_price'],
-            'bid_price': quote['bid_price'],
-            'high_price': quote['high_price'],
-            'low_price': quote['low_price'],
-            'volume': quote['volume']
+        ticker = binance_client.get_ticker(symbol=f"{symbol}USDT")
+        infos[symbol] = {
+            'symbol': symbol,
+            'ask_price': float(ticker['askPrice']),
+            'bid_price': float(ticker['bidPrice']),
+            'high_price': float(ticker['highPrice']),
+            'low_price': float(ticker['lowPrice']),
+            'volume': float(ticker['volume']),
         }
-        infos[symbol] = useful_info
     return infos
 
 def get_balance():
-    profile = rh.profiles.load_account_profile()
-    return float(profile["buying_power"])-1  # returns total account equity minus one for fees
+    account_info = binance_client.get_account()
+    for asset in account_info['balances']:
+        if asset['asset'] == 'USDT':
+            return float(asset['free'])  # Use USDT as the base currency
+    return 0
 
 def buy_crypto_price(symbol, amount):
-    amount = float(amount)
-    res = rh.order_buy_crypto_by_price(symbol, amount)
+    order = binance_client.order_market_buy(
+        symbol=f"{symbol}USDT",
+        quoteOrderQty=amount  # Specify the amount in USD
+    )
     record_trade("buy_crypto_price", symbol, amount)
-    print(res)
+    logging.info(f"Buy market order placed: {order}")
 
 def buy_crypto_limit(symbol, amount, limit):
-    amount = float(amount)
-    limit = float(limit)
-    res = rh.order_buy_crypto_limit_by_price(symbol, amount, limit)
+    quantity = round(amount / limit, 6)
+    order = binance_client.order_limit_buy(
+        symbol=f"{symbol}USDT",
+        quantity=quantity,
+        price=limit
+    )
     record_trade("buy_crypto_limit", symbol, amount, limit)
-    print(res)
+    logging.info(f"Buy limit order placed: {order}")
 
 def sell_crypto_price(symbol, amount):
-    amount = float(amount)
-    res = rh.order_sell_crypto_by_price(symbol, amount)
+    order = binance_client.order_market_sell(
+        symbol=f"{symbol}USDT",
+        quoteOrderQty=amount  # Specify the amount in USD
+    )
     record_trade("sell_crypto_price", symbol, amount)
-    print(res)
+    logging.info(f"Sell market order placed: {order}")
 
 def sell_crypto_limit(symbol, amount, limit):
-    amount = float(amount)
-    limit = float(limit)
-    res = rh.order_sell_crypto_limit_by_price(symbol, amount, limit)
+    quantity = round(amount / limit, 6)
+    order = binance_client.order_limit_sell(
+        symbol=f"{symbol}USDT",
+        quantity=quantity,
+        price=limit
+    )
     record_trade("sell_crypto_limit", symbol, amount, limit)
-    print(res)
+    logging.info(f"Sell limit order placed: {order}")
 
 def get_open_orders():
-    positions_data = rh.get_all_open_crypto_orders()
-    
-    useful_infos = []
-    for position in positions_data:
-        useful_info = {
-            'id': position['id'],
-            'type': position['type'],
-            'side': position['side'],
-            'quantity': position['quantity'],
-            'price': position['price']
+    open_orders = binance_client.get_open_orders()
+    return [
+        {
+            'id': order['orderId'],
+            'symbol': order['symbol'],
+            'side': order['side'],
+            'price': float(order['price']),
+            'quantity': float(order['origQty']),
         }
-        useful_infos.append(useful_info)
-    return useful_infos
+        for order in open_orders
+    ]
 
 def get_positions():
-    positions_data = rh.crypto.get_crypto_positions()
+    account_info = binance_client.get_account()
+    positions = []
+    for asset in account_info['balances']:
+        quantity = float(asset['free'])
+        if quantity > 0 and asset['asset'] in symbols:  # Only include symbols the bot trades
+            try:
+                ticker = binance_client.get_ticker(symbol=f"{asset['asset']}USDT")
+                current_price = float(ticker['lastPrice'])
+                total_value = round(quantity * current_price, 2)
+                positions.append({
+                    'symbol': asset['asset'],
+                    'quantity': round(quantity, 4),  # Limit decimals for clarity
+                    'current_price': round(current_price, 2),
+                    'total_value_usdt': total_value
+                })
+            except BinanceAPIException as e:
+                logging.warning(f"Could not fetch data for {asset['asset']}USDT: {e}")
+    return positions
 
-    useful_infos = []
-    for position in positions_data:
-        if float(position['quantity']) > 0:  # we only want open positions with a quantity greater than 0
-            currency_code = position['currency']['code']
-            # Fetch current price for this cryptocurrency
-            current_price_data = rh.crypto.get_crypto_quote(currency_code)
-            current_price = float(current_price_data['mark_price'])
-            # Convert quantity to dollar amount
-            quantity = float(position['quantity'])
-            dollar_amount = quantity * current_price
+def get_portfolio_value_in_usd():
+    # Fetch current positions
+    positions = get_positions()
+    # Calculate total value of all positions in USD
+    portfolio_value = sum(pos['total_value_usdt'] for pos in positions)
+    # Add the USDT balance
+    portfolio_value += get_balance()
+    return round(portfolio_value, 2)
 
-            useful_info = {
-                'symbol': currency_code,
-                'quantity': quantity,
-                'dollar_amount': dollar_amount,
-            }
-            useful_infos.append(useful_info)
-    print(useful_infos)
-    return useful_infos
 
 def cancel_order(orderId):
-    rh.cancel_crypto_order(orderId)
+    binance_client.cancel_order(orderId=orderId)
+    logging.info(f"Order cancelled: {orderId}")
 
 def get_historical_data():
-    # Define the start and end times
-    end_time = datetime.now()
-    start_time = end_time - timedelta(days=7)
-
     historicals = {}
-
     for symbol in symbols:
-        # Fetch the historical data
-        data = rh.crypto.get_crypto_historicals(symbol,
-                                                interval='10minute',
-                                                bounds='24_7',
-                                                span="hour")
-
-        # Filter out unnecessary information
-        useful_data = []
-        for entry in data:
-            useful_entry = {
-                'begins_at': entry['begins_at'],
-                'open_price': entry['open_price'],
-                'close_price': entry['close_price'],
-                'high_price': entry['high_price'],
-                'low_price': entry['low_price'],
-                'volume': entry['volume'],
+        klines = binance_client.get_klines(
+            symbol=f"{symbol}USDT",
+            interval=Client.KLINE_INTERVAL_10MINUTE,
+            limit=100
+        )
+        historicals[symbol] = [
+            {
+                'begins_at': kline[0],  # Open time
+                'open_price': float(kline[1]),
+                'close_price': float(kline[4]),
+                'high_price': float(kline[2]),
+                'low_price': float(kline[3]),
+                'volume': float(kline[5]),
             }
-            useful_data.append(useful_entry)
-        
-        historicals[symbol] = useful_data
-
+            for kline in klines
+        ]
     return historicals
 
 def get_all_crypto_news():
@@ -195,7 +235,6 @@ def get_all_crypto_news():
     return all_news
 
 def get_trade_advice():
-    # Get all the necessary information
     crypto_info = get_crypto_infos()
     balance = get_balance()
     positions = get_positions()
@@ -203,9 +242,10 @@ def get_trade_advice():
     open_orders = get_open_orders()
     past_trade_info = '\n'.join([str(trade) for trade in past_trades])
 
-    # Convert the info into a format suitable for the AI prompt
+    # Combine data into the prompt
     info_str = f"Crypto Info: {crypto_info}\nBalance: {balance}\nPositions: {positions}\nNews: {news}\nOpen Orders: {open_orders}\nPast Trades: {past_trade_info}"
     prompt = PROMPT_FOR_AI + "\n\n" + info_str
+
     user_prompt = """
 What should we do to make the most amount of profit based on the info?
 
@@ -219,47 +259,50 @@ do_nothing() Use this when you don't see any necessary changes.
 CRITICAL: RESPOND IN ONLY THE ABOVE FORMAT. EXAMPLE: buy_crypto_price("BTC", 30). ONLY RESPOND WITH ONE COMMAND.
     """
 
-    # Feed the prompt to the AI
-    response = openai.ChatCompletion.create(
+    # Log or print the prompt
+    # print(f"Prompt sent to OpenAI:\n{prompt}\n\nUser prompt:\n{user_prompt}")
+
+    # Call the OpenAI API
+    response = client.chat.completions.create(
         model="gpt-4",
         messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": user_prompt}
         ],
-        temperature = 0.2,
+        temperature=0.2,
     )
-    res = response.choices[0].message["content"]
-    res = res.replace("\\", "")
-    return res
+    return response.choices[0].message.content
+
 
 def execute_response(response):
-    match = re.match(r'(\w+)\((.*?)\)', response)
-    if match:
-        command = match.group(1)
-        args = [arg.strip().strip('\"') for arg in match.group(2).split(',')]  # remove surrounding quotation marks
-        if len(args) == 1:
-            print("Doing nothing...")
-            return
-        command_map = {
-            "buy_crypto_price": buy_crypto_price,
-            "buy_crypto_limit": buy_crypto_limit,
-            "sell_crypto_price": sell_crypto_price,
-            "sell_crypto_limit": sell_crypto_limit,
-            "cancel_order": cancel_order,
-            "do_nothing": lambda: None  # no action needed
-        }
-        function_to_execute = command_map.get(command)  # retrieves the function from command_map dictionary
-        if function_to_execute:
-            print(f"Executing command {function_to_execute} with args {args} in 5 seconds.")
-            time.sleep(5)
-            function_to_execute(*args)  # executes the function with its arguments
+    try:
+        match = re.match(r'(\w+)\((.*?)\)', response)
+        if match:
+            command = match.group(1)
+            args = [arg.strip().strip('\"') for arg in match.group(2).split(',')]
+            command_map = {
+                "buy_crypto_price": buy_crypto_price,
+                "buy_crypto_limit": buy_crypto_limit,
+                "sell_crypto_price": sell_crypto_price,
+                "sell_crypto_limit": sell_crypto_limit,
+                "cancel_order": cancel_order,
+                "do_nothing": lambda *args: None
+            }
+            function_to_execute = command_map.get(command)
+            if function_to_execute:
+                logging.info(f"Executing command: {command} with args: {args}")
+                function_to_execute(*args)
+                portfolio_value = get_portfolio_value_in_usd()
+                logging.info(f"Portfolio value in USD: {portfolio_value}")
+            else:
+                logging.error(f"Invalid command received: {command}")
         else:
-            print("Invalid command:", command)
-    else:
-        print("Invalid response, retrying:", response)
-        time.sleep(10)
-        execute_response(get_trade_advice())
+            logging.error(f"Invalid response format: {response}")
+    except BinanceAPIException as e:
+        logging.error(f"Binance API Exception: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
 
 while True:
     execute_response(get_trade_advice())
-    time.sleep(1800)
+    time.sleep(1800)  # Run every 30 minutes
