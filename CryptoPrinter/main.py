@@ -31,7 +31,7 @@ binance_client = Client(
     api_key=os.getenv("BINANCE_API_KEY"),
     api_secret=os.getenv("BINANCE_API_SECRET"),
 )
-binance_client.API_URL = 'https://testnet.binance.vision/api'  # Use testnet URL
+# binance_client.API_URL = 'https://testnet.binance.vision/api'  # Use testnet URL
 
 
 # Load environment variables
@@ -41,6 +41,8 @@ openai_api_key = os.getenv("OPENAI_API_KEY")
 client = openai.OpenAI(api_key=openai_api_key)
 
 symbols = ["BTC", "ETH", "XRP", "SOL", "DOGE", "ADA", "AVAX", "LINK", "SHIB", "XLM", "XTZ"]
+# symbols = ["BTC", "ETH", "BNB", "XRP", "ADA"]
+
 
 PROMPT_FOR_AI = f"""
 You are an advanced trading AI designed to maximize profits while minimizing risks in cryptocurrency trading. Your mission is to achieve the highest possible return over one month, trading the following cryptocurrencies: BTC, ETH, XRP, SOL, DOGE, ADA, AVAX, LINK, SHIB, XLM, and XTZ. You have access to real-time market data, technical indicators, and news.
@@ -65,7 +67,7 @@ Adapt strategies based on market trends (bullish, bearish, or sideways).
 
 Decision Frequency:
 
-Make decisions every 15 minutes based on updated data.
+Make decisions every 30 minutes based on updated data.
 Avoid overtrading; do not execute more than 5 trades per hour unless there is an exceptionally strong rationale.
 
 Execution Options:
@@ -95,7 +97,6 @@ The current date and time is {datetime.now().isoformat()}.
 
 Your Objective: Make intelligent, data-driven decisions to maximize returns while protecting the account from excessive risk. Always prioritize profits and avoid overtrading.
 """
-
 past_trades = []
 
 def record_trade(action, symbol, amount, limit=None):
@@ -286,17 +287,18 @@ CRITICAL: RESPOND IN ONLY THE ABOVE FORMAT. EXAMPLE: buy_crypto_price("BTC", 30)
     """
 
     # Log or print the prompt
-    # print(f"Prompt sent to OpenAI:\n{prompt}\n\nUser prompt:\n{user_prompt}")
+    print(f"Prompt sent to OpenAI:\n{prompt}\n\nUser prompt:\n{user_prompt}")
 
     # Call the OpenAI API
     response = client.chat.completions.create(
-        model="gpt-4",
+        model="gpt-4o",
         messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": user_prompt}
         ],
         temperature=0.2,
     )
+    print('response from openai:', response.choices[0].message.content)
     return response.choices[0].message.content
 
 
@@ -331,4 +333,4 @@ def execute_response(response):
 
 while True:
     execute_response(get_trade_advice())
-    time.sleep(900)  # Run every 15 minutes
+    time.sleep(1800)  # Run every 15 minutes
